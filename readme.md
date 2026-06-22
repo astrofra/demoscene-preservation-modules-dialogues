@@ -7,12 +7,15 @@
 ## ✨ Project Goals
 
 - Mirror/download a large dataset of ProTracker (MOD), FastTracker (XM), ScreamTracker (S3M), and Impulse Tracker (IT) music modules.
+  - primary source : https://ftp.scene.org/pub/music/artists/
 - Extract embedded text content (instrument/sample names, song messages).
 - Classify and group modules by artist/handle.
 - Use local LLM (via [Ollama](https://ollama.ai/)) to:
   - Summarize message tone, content, sentiment.
   - Detect inferred relationships between scene members.
+  - Model : Ministral-3:14b
 - Map "greets" and mentions into a directed social graph.
+  - Model : qwen3-embedding
 - Provide a navigable timeline and interface for exploring the findings.
 
 ---
