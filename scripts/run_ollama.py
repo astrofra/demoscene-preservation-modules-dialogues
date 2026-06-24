@@ -3,9 +3,16 @@ import json
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from common_config import get_path, load_config, prepare_runtime_directories, resolve_repo_path
+from common_config import (
+    build_json_artifact_path,
+    get_path,
+    load_config,
+    prepare_runtime_directories,
+    relative_repo_path,
+    resolve_repo_path,
+)
 from common_state import ensure_state_files, find_item, load_state, save_state
-from common_utils import atomic_write_json, build_logger, now_iso, sha256_text
+from common_utils import atomic_write_json, build_logger, ensure_directory, now_iso, sha256_text
 
 
 PROMPT_VERSION = "v1"
@@ -20,9 +27,12 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_summary_state_item(sha256_value):
+def build_summary_state_item(module_item):
     return {
-        "sha256": sha256_value,
+        "module_id": module_item["module_id"],
+        "sha256": module_item.get("sha256"),
+        "source_name": module_item.get("source_name"),
+        "remote_path": module_item.get("remote_path"),
         "model_name": None,
         "prompt_version": None,
         "input_text_hash": None,
@@ -71,17 +81,73 @@ def call_ollama(config, prompt):
     return json.loads(outer_payload["response"])
 
 
-def write_summary_artifact(config, sha256_value, payload):
-    output_path = get_path(config, "summaries_dir") / (sha256_value + ".json")
+def write_summary_artifact(config, module_item, payload):
+    output_path = build_json_artifact_path(
+        get_path(config, "summaries_dir"),
+        module_item["source_name"],
+        module_item["remote_path"]
+    )
     atomic_write_json(output_path, payload)
     return output_path
 
 
-def copy_existing_summary(existing_payload, sha256_value):
+def copy_existing_summary(existing_payload, module_item):
     copied = dict(existing_payload)
-    copied["sha256"] = sha256_value
+    copied["module_id"] = module_item["module_id"]
+    copied["sha256"] = module_item.get("sha256")
     copied["summarized_at"] = now_iso()
     return copied
+
+
+def build_summary_output_path(config, module_item):
+    return build_json_artifact_path(
+        get_path(config, "summaries_dir"),
+        module_item["source_name"],
+        module_item["remote_path"]
+    )
+
+
+def migrate_summaries_state(summaries_state, modules_state, config, logger):
+    modules_by_sha = {}
+    modules_by_id = {}
+    for module_item in modules_state["items"]:
+        if module_item.get("module_id"):
+            modules_by_id[module_item["module_id"]] = module_item
+        if module_item.get("sha256"):
+            modules_by_sha.setdefault(module_item["sha256"], []).append(module_item)
+
+    for summary_item in summaries_state["items"]:
+        module_item = None
+
+        if summary_item.get("module_id"):
+            module_item = modules_by_id.get(summary_item["module_id"])
+        elif summary_item.get("sha256"):
+            matches = modules_by_sha.get(summary_item["sha256"], [])
+            if len(matches) == 1:
+                module_item = matches[0]
+                summary_item["module_id"] = module_item["module_id"]
+
+        if module_item is None:
+            continue
+
+        summary_item["sha256"] = module_item.get("sha256")
+        summary_item["source_name"] = module_item.get("source_name")
+        summary_item["remote_path"] = module_item.get("remote_path")
+
+        if not summary_item.get("summary_path"):
+            continue
+
+        current_path = resolve_repo_path(summary_item["summary_path"])
+        expected_path = build_summary_output_path(config, module_item)
+        if current_path == expected_path or not current_path.exists():
+            summary_item["summary_path"] = relative_repo_path(expected_path) if expected_path.exists() else summary_item["summary_path"]
+            continue
+
+        ensure_directory(expected_path.parent)
+        if not expected_path.exists():
+            current_path.replace(expected_path)
+            logger.info("Moved summary file to readable path for %s", module_item["remote_path"])
+        summary_item["summary_path"] = relative_repo_path(expected_path)
 
 
 def main():
@@ -99,9 +165,13 @@ def main():
     summaries_state_path = get_path(config, "summaries_state")
     summaries_state = load_state(summaries_state_path)
 
+    migrate_summaries_state(summaries_state, modules_state, config, logger)
+
     for module_item in modules_state["items"]:
-        if find_item(summaries_state["items"], ("sha256",), {"sha256": module_item["sha256"]}) is None:
-            summaries_state["items"].append(build_summary_state_item(module_item["sha256"]))
+        if not module_item.get("module_id"):
+            continue
+        if find_item(summaries_state["items"], ("module_id",), {"module_id": module_item["module_id"]}) is None:
+            summaries_state["items"].append(build_summary_state_item(module_item))
     save_state(summaries_state_path, summaries_state)
 
     processed = 0
@@ -114,9 +184,13 @@ def main():
         if module_item["parse_status"] != "done":
             continue
 
-        summary_item = find_item(summaries_state["items"], ("sha256",), {"sha256": module_item["sha256"]})
+        summary_item = find_item(summaries_state["items"], ("module_id",), {"module_id": module_item["module_id"]})
         if summary_item is None:
             continue
+
+        summary_item["sha256"] = module_item.get("sha256")
+        summary_item["source_name"] = module_item.get("source_name")
+        summary_item["remote_path"] = module_item.get("remote_path")
 
         if summary_item["summary_status"] in ["done", "skipped"] and summary_item.get("summary_path") and not args.force:
             summary_path = resolve_repo_path(summary_item["summary_path"])
@@ -140,6 +214,7 @@ def main():
         try:
             if module_item["llm_decision"] == "skip" or not useful_text_fragments:
                 payload = {
+                    "module_id": module_item["module_id"],
                     "sha256": module_item["sha256"],
                     "summary_status": "skipped",
                     "summary_skip_reason": module_item["llm_reason"],
@@ -154,22 +229,22 @@ def main():
                     "confidence": None,
                     "summarized_at": now_iso()
                 }
-                output_path = write_summary_artifact(config, module_item["sha256"], payload)
+                output_path = write_summary_artifact(config, module_item, payload)
                 summary_item["summary_status"] = "skipped"
                 summary_item["summary_error"] = None
                 summary_item["summary_skip_reason"] = module_item["llm_reason"]
-                summary_item["summary_path"] = str(output_path.relative_to(resolve_repo_path("."))).replace("\\", "/")
+                summary_item["summary_path"] = relative_repo_path(output_path)
                 summary_item["tone"] = None
                 summary_item["mentions"] = []
                 summary_item["summarized_at"] = payload["summarized_at"]
-                logger.info("Skipped LLM for %s", module_item["sha256"])
+                logger.info("Skipped LLM for %s", module_item["remote_path"])
                 processed += 1
                 save_state(summaries_state_path, summaries_state)
                 continue
 
             reused = None
             for existing_item in summaries_state["items"]:
-                if existing_item["sha256"] == module_item["sha256"]:
+                if existing_item.get("module_id") == module_item["module_id"]:
                     continue
                 if existing_item.get("summary_status") != "done":
                     continue
@@ -190,11 +265,12 @@ def main():
                 break
 
             if reused is not None and not args.force:
-                payload = copy_existing_summary(reused, module_item["sha256"])
+                payload = copy_existing_summary(reused, module_item)
             else:
                 prompt = build_prompt(useful_text_fragments)
                 result = call_ollama(config, prompt)
                 payload = {
+                    "module_id": module_item["module_id"],
                     "sha256": module_item["sha256"],
                     "summary_status": "done",
                     "summary_skip_reason": None,
@@ -210,20 +286,20 @@ def main():
                     "summarized_at": now_iso()
                 }
 
-            output_path = write_summary_artifact(config, module_item["sha256"], payload)
+            output_path = write_summary_artifact(config, module_item, payload)
             summary_item["summary_status"] = payload["summary_status"]
             summary_item["summary_error"] = None
             summary_item["summary_skip_reason"] = payload["summary_skip_reason"]
-            summary_item["summary_path"] = str(output_path.relative_to(resolve_repo_path("."))).replace("\\", "/")
+            summary_item["summary_path"] = relative_repo_path(output_path)
             summary_item["tone"] = payload["tone"]
             summary_item["mentions"] = payload["mentions"]
             summary_item["summarized_at"] = payload["summarized_at"]
-            logger.info("Summarized %s", module_item["sha256"])
+            logger.info("Summarized %s", module_item["remote_path"])
             processed += 1
         except Exception as exc:
             summary_item["summary_status"] = "failed"
             summary_item["summary_error"] = str(exc)
-            logger.error("Summary failed for %s: %s", module_item["sha256"], exc)
+            logger.error("Summary failed for %s: %s", module_item.get("remote_path") or module_item.get("module_id"), exc)
         finally:
             save_state(summaries_state_path, summaries_state)
 

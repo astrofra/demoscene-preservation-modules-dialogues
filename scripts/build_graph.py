@@ -111,7 +111,7 @@ def main():
     logger = build_logger("build_graph", get_path(config, "logs_dir"))
     modules_state = load_state(get_path(config, "modules_state"))
     summaries_state = load_state(get_path(config, "summaries_state"))
-    summaries_by_sha = dict((item["sha256"], item) for item in summaries_state["items"])
+    summaries_by_module_id = dict((item["module_id"], item) for item in summaries_state["items"] if item.get("module_id"))
 
     nodes = {}
     edges = {}
@@ -135,7 +135,7 @@ def main():
             target_id = register_node(nodes, greet)
             add_edge(edges, source_id, target_id, "greet")
 
-        summary_item = summaries_by_sha.get(module_item["sha256"])
+        summary_item = summaries_by_module_id.get(module_item.get("module_id"))
         if summary_item is None:
             continue
         if summary_item.get("summary_status") != "done":

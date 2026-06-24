@@ -32,7 +32,7 @@ The implementation must favor simple, readable Python over abstraction-heavy des
 ### In Scope
 
 - remote file discovery
-- incremental download and deduplication
+- incremental download and duplicate detection
 - parsing `.mod`, `.xm`, `.s3m`, and `.it`
 - metadata normalization
 - local LLM summarization through Ollama HTTP API
@@ -81,10 +81,11 @@ MODialogues/
 |
 +-- data/
 |   +-- raw_modules/
-|   |   +-- mod/
-|   |   +-- xm/
-|   |   +-- s3m/
-|   |   +-- it/
+|   |   +-- sceneorg-artists/
+|   |   |   +-- zipp/
+|   |   |       +-- 1998/
+|   |   |           +-- djz_poof.xm
+|   |   +-- _partial/
 |   +-- parsed_metadata/
 |   +-- summaries/
 |   +-- graphs/
@@ -193,6 +194,7 @@ Tracks discovered files from remote sources.
 
 Required item fields:
 
+- `module_id`
 - `source_name`
 - `remote_path`
 - `remote_url`
@@ -212,11 +214,15 @@ Unique key:
 
 #### `modules.json`
 
-Tracks parsing results for unique downloaded file contents.
+Tracks parsing results for one source file, identified by a stable internal ID.
 
 Required item fields:
 
+- `module_id`
 - `sha256`
+- `source_name`
+- `remote_path`
+- `local_path`
 - `format`
 - `parse_status` (`pending`, `done`, `failed`, `skipped`)
 - `parse_error`
@@ -234,7 +240,7 @@ Required item fields:
 
 Unique key:
 
-- `sha256`
+- `module_id`
 
 #### `summaries.json`
 
@@ -242,7 +248,10 @@ Tracks LLM output.
 
 Required item fields:
 
+- `module_id`
 - `sha256`
+- `source_name`
+- `remote_path`
 - `model_name`
 - `prompt_version`
 - `input_text_hash`
@@ -256,7 +265,7 @@ Required item fields:
 
 Unique key:
 
-- `sha256`
+- `module_id`
 
 ### 7.2 State Write Rules
 
@@ -280,8 +289,8 @@ Rules:
 
 - discovery can be rerun at any time
 - download skips items already marked `done` if the target file still exists
-- parse skips hashes already marked `done` if the metadata JSON still exists
-- summarization skips hashes already marked `done` if the summary JSON still exists
+- parse skips module IDs already marked `done` if the metadata JSON still exists
+- summarization skips module IDs already marked `done` if the summary JSON still exists
 - graph building may rebuild from scratch each time because it is derived output
 
 If a state item says `done` but the corresponding artifact file is missing, the stage must reset that item to `pending` and recreate the artifact.
@@ -296,6 +305,7 @@ Example `remote_files.json`:
   "updated_at": "2026-06-23T10:00:00Z",
   "items": [
     {
+      "module_id": "mod_7e31fd8d54e2",
       "source_name": "sceneorg-artists",
       "remote_path": "artists/traven/nytrik.mod",
       "remote_url": "https://ftp.scene.org/pub/music/artists/traven/nytrik.mod",
@@ -306,7 +316,7 @@ Example `remote_files.json`:
       "last_seen_at": "2026-06-23T10:00:00Z",
       "download_status": "done",
       "download_error": null,
-      "local_path": "data/raw_modules/mod/8b4d...c1.mod",
+      "local_path": "data/raw_modules/sceneorg-artists/artists/traven/nytrik.mod",
       "sha256": "8b4d...c1"
     }
   ]
@@ -321,11 +331,15 @@ Example `modules.json`:
   "updated_at": "2026-06-23T10:05:00Z",
   "items": [
     {
+      "module_id": "mod_7e31fd8d54e2",
       "sha256": "8b4d...c1",
+      "source_name": "sceneorg-artists",
+      "remote_path": "artists/traven/nytrik.mod",
+      "local_path": "data/raw_modules/sceneorg-artists/artists/traven/nytrik.mod",
       "format": "mod",
       "parse_status": "done",
       "parse_error": null,
-      "metadata_path": "data/parsed_metadata/8b4d...c1.json",
+      "metadata_path": "data/parsed_metadata/sceneorg-artists/artists/traven/nytrik.mod.json",
       "title": "Why not call?",
       "tracker_name": "ProTracker",
       "author_guess": "Traven",
@@ -349,14 +363,17 @@ Example `summaries.json`:
   "updated_at": "2026-06-23T10:20:00Z",
   "items": [
     {
+      "module_id": "mod_7e31fd8d54e2",
       "sha256": "8b4d...c1",
+      "source_name": "sceneorg-artists",
+      "remote_path": "artists/traven/nytrik.mod",
       "model_name": "ministral",
       "prompt_version": "v1",
       "input_text_hash": "31f2...9a",
       "summary_status": "done",
       "summary_error": null,
       "summary_skip_reason": null,
-      "summary_path": "data/summaries/8b4d...c1.json",
+      "summary_path": "data/summaries/sceneorg-artists/artists/traven/nytrik.mod.json",
       "tone": "melancholic",
       "mentions": ["Nytrik"],
       "summarized_at": "2026-06-23T10:20:00Z"
@@ -367,21 +384,29 @@ Example `summaries.json`:
 
 ## 8. Artifact Naming
 
-Canonical raw file storage should be hash-based.
+Raw file storage should be readable and mirror the source tree as closely as possible.
 
 Format:
 
-- `data/raw_modules/mod/<sha256>.mod`
-- `data/raw_modules/xm/<sha256>.xm`
-- `data/raw_modules/s3m/<sha256>.s3m`
-- `data/raw_modules/it/<sha256>.it`
+- `data/raw_modules/<source_name>/<remote_path>`
 
-This avoids duplicate content from multiple mirrors or duplicate filenames.
+Examples:
 
-Parsed metadata and summaries should also be keyed by hash:
+- `data/raw_modules/sceneorg-artists/zipp/1998/djz_poof.xm`
+- `data/raw_modules/sceneorg-artists/artists/traven/nytrik.mod`
 
-- `data/parsed_metadata/<sha256>.json`
-- `data/summaries/<sha256>.json`
+The raw filename should stay readable.
+The unique identifiers live in JSON state, not in the visible filename.
+
+Required internal identifiers:
+
+- `module_id` = stable internal ID for one source file
+- `sha256` = content hash for integrity and duplicate detection
+
+Parsed metadata and summaries should mirror the same readable path:
+
+- `data/parsed_metadata/<source_name>/<remote_path>.json`
+- `data/summaries/<source_name>/<remote_path>.json`
 
 ## 9. Stage 1: Discovery and Download
 
@@ -395,6 +420,7 @@ Implemented in `scripts/fetch_modules.py`.
 - optionally list recent discoveries
 - download files with resume support
 - compute SHA-256 during download
+- preserve a readable local file path
 - write files atomically
 
 ### 9.2 Source Handling
@@ -436,14 +462,15 @@ Requirements:
 - if interrupted, reuse the `.part` file when possible
 - if the source does not support byte-range resume, restart that file cleanly
 
-### 9.5 Deduplication
+### 9.5 Duplicate Detection
 
 After download:
 
 - compute `sha256`
-- store the file under the canonical hash-based path
-- if another remote file already has the same hash, do not keep a second raw copy
-- still keep both `remote_files.json` items so provenance is preserved
+- store the file under its readable mirrored path
+- keep the hash in state for integrity checks
+- detect identical content through `sha256`
+- do not use the hash as the primary visible filename
 
 ## 10. Stage 2: Parsing and Metadata Extraction
 
@@ -451,7 +478,7 @@ Implemented in `scripts/parse_modules.py`.
 
 ### 10.1 Responsibilities
 
-- select unique downloaded hashes with pending parse status
+- select downloaded module IDs with pending parse status
 - extract textual metadata from each module
 - separate instrument-like fragments from potentially social text
 - assign first-pass rule-based labels
@@ -476,7 +503,9 @@ Every parsed JSON must contain these fields:
 
 ```json
 {
+  "module_id": "string",
   "sha256": "string",
+  "local_path": "string",
   "source_files": [
     {
       "source_name": "sceneorg-artists",
@@ -702,7 +731,7 @@ Required response fields:
 ```
 
 The prompt version must be stored so summaries can be regenerated later if the prompt changes.
-If the configured model or prompt version changes, the existing summary item for that hash should be set back to `pending`.
+If the configured model or prompt version changes, the existing summary item for that module should be set back to `pending`.
 
 ### 11.6 Summary Output Format
 
@@ -710,6 +739,7 @@ Each summary JSON should contain:
 
 ```json
 {
+  "module_id": "string",
   "sha256": "string",
   "summary_status": "done|skipped|failed",
   "summary_skip_reason": "string or null",
@@ -873,7 +903,7 @@ The first usable version is complete when it can:
 
 1. crawl at least one configured remote source and record discovered module files
 2. download a batch of module files and resume after interruption
-3. deduplicate identical files by content hash
+3. keep readable raw file paths while storing content hashes for integrity and duplicate detection
 4. detect instrument-like text locally and avoid sending it to the LLM
 5. classify obvious cases locally such as greetings, signatures, contact, and work offers
 6. parse at least title plus embedded textual sample or instrument names where available

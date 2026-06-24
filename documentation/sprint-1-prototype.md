@@ -20,7 +20,9 @@ The main goal is to validate the workflow shape:
 - JSON state store under `data/state/`
 - atomic state file writes
 - resumable download state
-- deduplication by SHA-256
+- readable raw file storage mirroring the source tree
+- stable internal `module_id` per source file
+- SHA-256 storage for integrity and duplicate detection
 - source discovery for:
   - `http_index`
   - `local_dir`
@@ -63,6 +65,12 @@ The prototype uses `remote_files.json`, `modules.json`, and `summaries.json` so 
 
 This makes manual inspection easier during early iteration.
 
+### Why Readable File Paths Instead of Hash-Named Raw Files
+
+The prototype keeps the original source path visible under `data/raw_modules/` because this repository is meant to be inspected by hand.
+
+The hash remains in state and artifacts for integrity, but it is no longer the primary filename for raw modules.
+
 ### Why `local_dir` Sources Are Included
 
 The remote crawl is the real target, but it is slow to test.
@@ -84,6 +92,7 @@ MOD parsing is the most mature part of the prototype because:
 - the HTTP crawler assumes plain directory listings with standard links
 - the LLM prompt contract is strict, but a local model can still return invalid JSON
 - graph quality depends heavily on author guessing and rule-based greet extraction
+- identical content may still exist multiple times on disk when it appears at multiple readable source paths
 
 ## Definition of Done for Sprint 1
 

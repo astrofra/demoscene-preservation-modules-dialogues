@@ -1,10 +1,20 @@
 import argparse
+import json
 import re
 from pathlib import Path
 
-from common_config import get_path, load_config, load_instrument_terms, load_rule_patterns, prepare_runtime_directories, resolve_repo_path
+from common_config import (
+    build_json_artifact_path,
+    get_path,
+    load_config,
+    load_instrument_terms,
+    load_rule_patterns,
+    prepare_runtime_directories,
+    relative_repo_path,
+    resolve_repo_path,
+)
 from common_state import ensure_state_files, find_item, load_state, save_state
-from common_utils import build_logger, normalize_handle, normalize_text_fragment, now_iso, unique_preserve_order
+from common_utils import atomic_write_json, build_logger, ensure_directory, normalize_handle, normalize_text_fragment, now_iso, unique_preserve_order
 
 
 TRACKER_SIGNATURES = {
@@ -295,21 +305,22 @@ def build_text_fragments(parsed):
     return unique_preserve_order(normalized)
 
 
-def build_source_files(remote_items):
-    source_files = []
-    for item in remote_items:
-        source_files.append({
-            "source_name": item["source_name"],
-            "remote_path": item["remote_path"],
-            "remote_url": item["remote_url"]
-        })
-    return source_files
+def build_source_files(remote_item):
+    return [{
+        "source_name": remote_item["source_name"],
+        "remote_path": remote_item["remote_path"],
+        "remote_url": remote_item["remote_url"]
+    }]
 
 
-def build_module_state_item(sha256_value, extension):
+def build_module_state_item(remote_item):
     return {
-        "sha256": sha256_value,
-        "format": extension.lstrip("."),
+        "module_id": remote_item["module_id"],
+        "sha256": remote_item.get("sha256"),
+        "source_name": remote_item["source_name"],
+        "remote_path": remote_item["remote_path"],
+        "local_path": remote_item.get("local_path"),
+        "format": remote_item["extension"].lstrip("."),
         "parse_status": "pending",
         "parse_error": None,
         "metadata_path": None,
@@ -324,6 +335,65 @@ def build_module_state_item(sha256_value, extension):
         "useful_fragment_count": 0,
         "parsed_at": None
     }
+
+
+def build_metadata_output_path(config, remote_item):
+    return build_json_artifact_path(
+        get_path(config, "parsed_metadata_dir"),
+        remote_item["source_name"],
+        remote_item["remote_path"]
+    )
+
+
+def migrate_metadata_path_if_needed(config, module_item, remote_item, logger):
+    if not module_item.get("metadata_path"):
+        return
+
+    current_path = resolve_repo_path(module_item["metadata_path"])
+    expected_path = build_metadata_output_path(config, remote_item)
+
+    if current_path == expected_path:
+        return
+    if not current_path.exists():
+        return
+
+    ensure_directory(expected_path.parent)
+    if not expected_path.exists():
+        current_path.replace(expected_path)
+        logger.info("Moved metadata file to readable path for %s", remote_item["remote_path"])
+
+    module_item["metadata_path"] = relative_repo_path(expected_path)
+
+
+def migrate_modules_state(modules_state, remote_state, config, logger):
+    remote_by_sha = {}
+    remote_by_module_id = {}
+    for remote_item in remote_state["items"]:
+        if remote_item.get("module_id"):
+            remote_by_module_id[remote_item["module_id"]] = remote_item
+        if remote_item.get("sha256"):
+            remote_by_sha.setdefault(remote_item["sha256"], []).append(remote_item)
+
+    for module_item in modules_state["items"]:
+        if module_item.get("module_id"):
+            remote_item = remote_by_module_id.get(module_item["module_id"])
+            if remote_item is not None:
+                module_item["source_name"] = remote_item["source_name"]
+                module_item["remote_path"] = remote_item["remote_path"]
+                module_item["local_path"] = remote_item.get("local_path")
+                migrate_metadata_path_if_needed(config, module_item, remote_item, logger)
+            continue
+
+        matches = remote_by_sha.get(module_item.get("sha256"), [])
+        if len(matches) != 1:
+            continue
+
+        remote_item = matches[0]
+        module_item["module_id"] = remote_item["module_id"]
+        module_item["source_name"] = remote_item["source_name"]
+        module_item["remote_path"] = remote_item["remote_path"]
+        module_item["local_path"] = remote_item.get("local_path")
+        migrate_metadata_path_if_needed(config, module_item, remote_item, logger)
 
 
 def main():
@@ -343,33 +413,39 @@ def main():
     instrument_terms = load_instrument_terms(config)
     compiled_patterns = compile_rule_patterns(load_rule_patterns(config))
 
-    grouped_by_sha = {}
+    migrate_modules_state(modules_state, remote_state, config, logger)
+
+    ready_remote_items = []
     for item in remote_state["items"]:
         if item.get("download_status") != "done":
             continue
-        sha256_value = item.get("sha256")
-        if not sha256_value:
+        if not item.get("module_id"):
             continue
-        grouped_by_sha.setdefault(sha256_value, []).append(item)
-
-    for sha256_value, remote_items in grouped_by_sha.items():
-        if find_item(modules_state["items"], ("sha256",), {"sha256": sha256_value}) is not None:
+        ready_remote_items.append(item)
+        if find_item(modules_state["items"], ("module_id",), {"module_id": item["module_id"]}) is not None:
             continue
-        modules_state["items"].append(build_module_state_item(sha256_value, remote_items[0]["extension"]))
+        modules_state["items"].append(build_module_state_item(item))
 
     save_state(modules_state_path, modules_state)
+    remote_by_module_id = dict((item["module_id"], item) for item in ready_remote_items)
 
     processed = 0
     for module_item in modules_state["items"]:
         if args.limit is not None and processed >= args.limit:
             break
 
-        if args.hash and module_item["sha256"] not in args.hash:
+        if args.hash and module_item.get("sha256") not in args.hash:
             continue
 
-        remote_items = grouped_by_sha.get(module_item["sha256"], [])
-        if not remote_items:
+        remote_item = remote_by_module_id.get(module_item.get("module_id"))
+        if not remote_item:
             continue
+
+        module_item["sha256"] = remote_item.get("sha256")
+        module_item["source_name"] = remote_item["source_name"]
+        module_item["remote_path"] = remote_item["remote_path"]
+        module_item["local_path"] = remote_item.get("local_path")
+        migrate_metadata_path_if_needed(config, module_item, remote_item, logger)
 
         metadata_path = None
         if module_item.get("metadata_path"):
@@ -378,7 +454,7 @@ def main():
         if module_item["parse_status"] == "done" and metadata_path and metadata_path.exists():
             continue
 
-        local_path = resolve_repo_path(remote_items[0]["local_path"])
+        local_path = resolve_repo_path(remote_item["local_path"])
         if not local_path.exists():
             module_item["parse_status"] = "failed"
             module_item["parse_error"] = "Local file is missing"
@@ -389,12 +465,14 @@ def main():
             parsed = parse_by_extension(local_path)
             text_fragments = build_text_fragments(parsed)
             classification = classify_text_fragments(text_fragments, instrument_terms, compiled_patterns, config)
-            source_files = build_source_files(remote_items)
-            filename = Path(remote_items[0]["remote_path"]).name
+            source_files = build_source_files(remote_item)
+            filename = Path(remote_item["remote_path"]).name
             author_guess, author_source = guess_author(source_files, filename)
 
             metadata = {
+                "module_id": module_item["module_id"],
                 "sha256": module_item["sha256"],
+                "local_path": remote_item["local_path"],
                 "source_files": source_files,
                 "filename": filename,
                 "format": parsed["format"],
@@ -421,14 +499,17 @@ def main():
                 "parsed_at": now_iso()
             }
 
-            output_path = get_path(config, "parsed_metadata_dir") / (module_item["sha256"] + ".json")
-            from common_utils import atomic_write_json
+            output_path = build_metadata_output_path(config, remote_item)
             atomic_write_json(output_path, metadata)
 
+            module_item["sha256"] = remote_item.get("sha256")
+            module_item["source_name"] = remote_item["source_name"]
+            module_item["remote_path"] = remote_item["remote_path"]
+            module_item["local_path"] = remote_item.get("local_path")
             module_item["format"] = parsed["format"]
             module_item["parse_status"] = "done"
             module_item["parse_error"] = None
-            module_item["metadata_path"] = str(output_path.relative_to(resolve_repo_path("."))).replace("\\", "/")
+            module_item["metadata_path"] = relative_repo_path(output_path)
             module_item["title"] = parsed["title"]
             module_item["tracker_name"] = parsed["tracker_name"]
             module_item["author_guess"] = author_guess
@@ -440,12 +521,12 @@ def main():
             module_item["useful_fragment_count"] = len(classification["useful_text_fragments"])
             module_item["parsed_at"] = metadata["parsed_at"]
 
-            logger.info("Parsed %s", module_item["sha256"])
+            logger.info("Parsed %s", module_item["remote_path"])
             processed += 1
         except Exception as exc:
             module_item["parse_status"] = "failed"
             module_item["parse_error"] = str(exc)
-            logger.error("Parse failed for %s: %s", module_item["sha256"], exc)
+            logger.error("Parse failed for %s: %s", module_item.get("remote_path") or module_item.get("module_id"), exc)
         finally:
             save_state(modules_state_path, modules_state)
 

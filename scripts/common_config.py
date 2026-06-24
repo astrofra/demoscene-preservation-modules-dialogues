@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 from common_utils import ensure_directory, load_json_file
@@ -11,6 +12,38 @@ def resolve_repo_path(value):
     if path.is_absolute():
         return path
     return (REPO_ROOT / path).resolve()
+
+
+def relative_repo_path(path):
+    return str(Path(path).resolve().relative_to(REPO_ROOT)).replace("\\", "/")
+
+
+def normalize_remote_path(remote_path):
+    parts = []
+    for raw_part in str(remote_path).replace("\\", "/").split("/"):
+        part = raw_part.strip()
+        if not part or part in [".", ".."]:
+            continue
+        parts.append(part)
+    return parts
+
+
+def build_module_id(source_name, remote_path):
+    key = source_name + "|" + "/".join(normalize_remote_path(remote_path))
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    return "mod_" + digest[:12]
+
+
+def build_readable_storage_path(base_dir, source_name, remote_path):
+    path = Path(base_dir) / source_name
+    for part in normalize_remote_path(remote_path):
+        path = path / part
+    return path
+
+
+def build_json_artifact_path(base_dir, source_name, remote_path):
+    readable_path = build_readable_storage_path(base_dir, source_name, remote_path)
+    return readable_path.with_name(readable_path.name + ".json")
 
 
 def load_config(config_path=None):
@@ -45,8 +78,7 @@ def prepare_runtime_directories(config):
     ensure_directory(get_path(config, "embeddings_dir"))
 
     raw_root = get_path(config, "raw_modules_dir")
-    for folder_name in ["mod", "xm", "s3m", "it", "_partial"]:
-        ensure_directory(raw_root / folder_name)
+    ensure_directory(raw_root / "_partial")
 
 
 def load_instrument_terms(config):

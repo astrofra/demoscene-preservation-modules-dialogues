@@ -1,5 +1,4 @@
 import argparse
-import hashlib
 import shutil
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -7,7 +6,15 @@ from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 from urllib.request import Request, url2pathname, urlopen
 
-from common_config import get_path, load_config, prepare_runtime_directories, resolve_repo_path
+from common_config import (
+    build_module_id,
+    build_readable_storage_path,
+    get_path,
+    load_config,
+    prepare_runtime_directories,
+    relative_repo_path,
+    resolve_repo_path,
+)
 from common_state import ensure_state_files, load_state, save_state, find_item
 from common_utils import build_logger, ensure_directory, now_iso
 
@@ -157,6 +164,7 @@ def update_remote_state(remote_state, discovered_items):
 
         if existing is None:
             new_item = {
+                "module_id": build_module_id(item["source_name"], item["remote_path"]),
                 "source_name": item["source_name"],
                 "remote_path": item["remote_path"],
                 "remote_url": item["remote_url"],
@@ -174,6 +182,7 @@ def update_remote_state(remote_state, discovered_items):
             created_count += 1
             continue
 
+        existing["module_id"] = existing.get("module_id") or build_module_id(item["source_name"], item["remote_path"])
         existing["remote_url"] = item["remote_url"]
         existing["extension"] = item["extension"]
         existing["remote_size"] = item["remote_size"]
@@ -185,13 +194,7 @@ def update_remote_state(remote_state, discovered_items):
 
 
 def build_partial_path(raw_modules_dir, item):
-    key = item["source_name"] + "|" + item["remote_path"]
-    key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    return raw_modules_dir / "_partial" / (key_hash + item["extension"] + ".part")
-
-
-def build_final_path(raw_modules_dir, extension, sha256_value):
-    return raw_modules_dir / extension.lstrip(".") / (sha256_value + extension)
+    return raw_modules_dir / "_partial" / (item["module_id"] + item["extension"] + ".part")
 
 
 def compute_sha256_and_size(path):
@@ -206,6 +209,34 @@ def compute_sha256_and_size(path):
             size += len(chunk)
 
     return digest.hexdigest(), size
+
+
+def build_expected_local_path(config, item):
+    return build_readable_storage_path(
+        get_path(config, "raw_modules_dir"),
+        item["source_name"],
+        item["remote_path"]
+    )
+
+
+def migrate_local_path_if_needed(config, item, logger):
+    if not item.get("local_path"):
+        return
+
+    current_path = resolve_repo_path(item["local_path"])
+    expected_path = build_expected_local_path(config, item)
+
+    if current_path == expected_path:
+        return
+    if not current_path.exists():
+        return
+
+    ensure_directory(expected_path.parent)
+    if not expected_path.exists():
+        current_path.replace(expected_path)
+        logger.info("Moved raw file to readable path for %s", item["remote_path"])
+
+    item["local_path"] = relative_repo_path(expected_path)
 
 
 def copy_local_source(item, partial_path):
@@ -245,17 +276,26 @@ def stream_http_source(item, partial_path, user_agent, timeout_seconds):
 def download_item(config, source_map, item, logger):
     raw_modules_dir = get_path(config, "raw_modules_dir")
     partial_path = build_partial_path(raw_modules_dir, item)
-    extension = item["extension"]
+    final_path = build_expected_local_path(config, item)
 
     source = source_map.get(item["source_name"])
     if source is None:
         raise RuntimeError("Missing source configuration for %s" % item["source_name"])
 
     if item["download_status"] == "done" and item.get("local_path"):
-        final_path = resolve_repo_path(item["local_path"])
-        if final_path.exists():
+        local_path = resolve_repo_path(item["local_path"])
+        if local_path.exists():
             return False
         item["download_status"] = "pending"
+
+    if final_path.exists() and item["download_status"] in ["pending", "failed"]:
+        sha256_value, _ = compute_sha256_and_size(final_path)
+        item["download_status"] = "done"
+        item["download_error"] = None
+        item["local_path"] = relative_repo_path(final_path)
+        item["sha256"] = sha256_value
+        logger.info("Recovered existing file %s", item["local_path"])
+        return True
 
     if source["type"] == "local_dir":
         copy_local_source(item, partial_path)
@@ -270,17 +310,14 @@ def download_item(config, source_map, item, logger):
         raise RuntimeError("Unsupported source type: %s" % source["type"])
 
     sha256_value, _ = compute_sha256_and_size(partial_path)
-    final_path = build_final_path(raw_modules_dir, extension, sha256_value)
     ensure_directory(final_path.parent)
-
     if final_path.exists():
-        partial_path.unlink()
-    else:
-        partial_path.replace(final_path)
+        final_path.unlink()
+    partial_path.replace(final_path)
 
     item["download_status"] = "done"
     item["download_error"] = None
-    item["local_path"] = str(final_path.relative_to(resolve_repo_path("."))).replace("\\", "/")
+    item["local_path"] = relative_repo_path(final_path)
     item["sha256"] = sha256_value
     logger.info("Downloaded %s -> %s", item["remote_path"], item["local_path"])
     return True
@@ -315,6 +352,10 @@ def main():
     source_map = dict((source["name"], source) for source in sources)
     remote_state_path = get_path(config, "remote_files_state")
     remote_state = load_state(remote_state_path)
+    for item in remote_state["items"]:
+        item["module_id"] = item.get("module_id") or build_module_id(item["source_name"], item["remote_path"])
+        migrate_local_path_if_needed(config, item, logger)
+    save_state(remote_state_path, remote_state)
 
     discover_selected = args.discover or (not args.discover and not args.download and args.recent_days is None)
     download_selected = args.download or (not args.discover and not args.download and args.recent_days is None)
@@ -332,6 +373,7 @@ def main():
                 break
             if item["source_name"] not in source_map:
                 continue
+            migrate_local_path_if_needed(config, item, logger)
             if item.get("download_status") == "done" and item.get("local_path"):
                 local_path = resolve_repo_path(item["local_path"])
                 if local_path.exists():
