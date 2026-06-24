@@ -1,0 +1,44 @@
+{
+  "greeting": [
+    "\\bgreetz?\\b",
+    "\\bgreets\\b",
+    "\\bhello\\b",
+    "\\bhi\\b",
+    "\\brespect to\\b"
+  ],
+  "signature": [
+    "\\bmusic by\\b",
+    "\\bcoded by\\b",
+    "\\bmade by\\b",
+    "\\bwritten by\\b",
+    "\\bby [a-z0-9_\\-]{2,}\\b"
+  ],
+  "work_offer": [
+    "\\bavailable for\\b",
+    "\\blooking for group\\b",
+    "\\bneed musician\\b",
+    "\\bneed coder\\b",
+    "\\bneed swap\\b",
+    "\\bfor contact\\b"
+  ],
+  "contact": [
+    "\\bwrite to\\b",
+    "\\bcall me\\b",
+    "\\bcontact\\b",
+    "\\bemail\\b",
+    "@"
+  ],
+  "technical_note": [
+    "\\bplay loud\\b",
+    "\\buse headphones\\b",
+    "\\b4 channel\\b",
+    "\\bstereo\\b",
+    "\\bmono\\b"
+  ],
+  "credits": [
+    "\\bsamples by\\b",
+    "\\binspired by\\b",
+    "\\bripped from\\b",
+    "\\bthanks to\\b"
+  ]
+}

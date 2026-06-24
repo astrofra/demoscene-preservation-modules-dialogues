@@ -1,0 +1,54 @@
+{
+  "sources": [
+    {
+      "name": "sceneorg-artists",
+      "type": "http_index",
+      "enabled": true,
+      "base_url": "https://ftp.scene.org/pub/music/artists/"
+    }
+  ],
+  "allowed_extensions": [
+    ".mod",
+    ".xm",
+    ".s3m",
+    ".it"
+  ],
+  "download_timeout_seconds": 60,
+  "user_agent": "MODialogues/0.1",
+  "classification": {
+    "instrument_terms_path": "config/instrument_terms.json",
+    "rule_patterns_path": "config/rule_patterns.json",
+    "llm_min_useful_chars": 24,
+    "llm_min_social_fragments": 1,
+    "llm_skip_if_only_labels": [
+      "instrument_only",
+      "greeting",
+      "signature",
+      "work_offer",
+      "contact",
+      "technical_note"
+    ]
+  },
+  "ollama": {
+    "base_url": "http://127.0.0.1:11434",
+    "model": "ministral",
+    "timeout_seconds": 120
+  },
+  "embeddings": {
+    "enabled": false,
+    "base_url": "http://127.0.0.1:11434",
+    "model": "qwen3-embedding"
+  },
+  "paths": {
+    "state_dir": "data/state",
+    "remote_files_state": "data/state/remote_files.json",
+    "modules_state": "data/state/modules.json",
+    "summaries_state": "data/state/summaries.json",
+    "raw_modules_dir": "data/raw_modules",
+    "parsed_metadata_dir": "data/parsed_metadata",
+    "summaries_dir": "data/summaries",
+    "graphs_dir": "data/graphs",
+    "logs_dir": "data/logs",
+    "embeddings_dir": "data/embeddings"
+  }
+}
