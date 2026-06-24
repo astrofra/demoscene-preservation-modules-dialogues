@@ -51,20 +51,21 @@ The implementation must favor simple, readable Python over abstraction-heavy des
 
 ## 4. High-Level Architecture
 
-The program should be a filesystem-based pipeline with one small SQLite database used as the central state store.
+The program should be a filesystem-based pipeline with a small set of JSON state files used as the central state store.
 
-Reason for SQLite:
+Reason for JSON state files:
 
-- it is included with Python
-- it avoids many fragile JSON state files
-- it makes resume and incremental processing simple
-- it is still easy to inspect manually
+- they are readable without any extra tool
+- they are easy to inspect and edit manually
+- they match the rest of the project outputs
+- they keep the first version simple
 
 The core rule is:
 
 - raw files and generated artifacts live in `data/`
-- pipeline state lives in one SQLite database
-- every stage reads pending work from the database and writes its results back to the database
+- pipeline state lives in a few JSON files under `data/state/`
+- every stage reads pending work from the state files and writes updates back atomically
+- the first version may rewrite the full state file after each processed item because simplicity is preferred over speed
 
 ## 5. Repository Layout
 
@@ -75,6 +76,8 @@ MODialogues/
 |
 +-- config/
 |   +-- config.json
+|   +-- instrument_terms.json
+|   +-- rule_patterns.json
 |
 +-- data/
 |   +-- raw_modules/
@@ -85,9 +88,12 @@ MODialogues/
 |   +-- parsed_metadata/
 |   +-- summaries/
 |   +-- graphs/
+|   +-- embeddings/          # Optional, not required for the first version
 |   +-- logs/
 |   +-- state/
-|       +-- pipeline.db
+|       +-- remote_files.json
+|       +-- modules.json
+|       +-- summaries.json
 |
 +-- scripts/
 |   +-- fetch_modules.py
@@ -95,7 +101,7 @@ MODialogues/
 |   +-- run_ollama.py
 |   +-- build_graph.py
 |   +-- run_pipeline.py
-|   +-- common_db.py
+|   +-- common_state.py
 |   +-- common_config.py
 |   +-- common_utils.py
 |
@@ -126,33 +132,67 @@ Example structure:
   "allowed_extensions": [".mod", ".xm", ".s3m", ".it"],
   "download_timeout_seconds": 60,
   "user_agent": "MODialogues/0.1",
+  "classification": {
+    "instrument_terms_path": "config/instrument_terms.json",
+    "rule_patterns_path": "config/rule_patterns.json",
+    "llm_min_useful_chars": 24,
+    "llm_min_social_fragments": 1,
+    "llm_skip_if_only_labels": [
+      "instrument_only",
+      "greeting",
+      "signature",
+      "work_offer",
+      "contact",
+      "technical_note"
+    ]
+  },
   "ollama": {
     "base_url": "http://127.0.0.1:11434",
     "model": "ministral",
-    "embedding_model": "qwen3-embedding",
     "timeout_seconds": 120
   },
+  "embeddings": {
+    "enabled": false,
+    "base_url": "http://127.0.0.1:11434",
+    "model": "qwen3-embedding"
+  },
   "paths": {
-    "database": "data/state/pipeline.db"
+    "state_dir": "data/state",
+    "remote_files_state": "data/state/remote_files.json",
+    "modules_state": "data/state/modules.json",
+    "summaries_state": "data/state/summaries.json",
+    "embeddings_dir": "data/embeddings"
   }
 }
 ```
 
 TOML should be avoided because Python 3.9 does not include a built-in TOML reader.
+The state store should use plain JSON files, not JSONL, so they remain easy to read manually.
 
 ## 7. Pipeline State Model
 
-The SQLite database is the source of truth for progress tracking.
+The JSON state files are the source of truth for progress tracking.
 
-### 7.1 Required Tables
+### 7.1 Required State Files
 
-#### `remote_files`
+Each state file should use this top-level structure:
+
+```json
+{
+  "version": 1,
+  "updated_at": "ISO-8601 timestamp",
+  "items": []
+}
+```
+
+The `items` list should be pretty-printed with `indent=2`.
+
+#### `remote_files.json`
 
 Tracks discovered files from remote sources.
 
-Required columns:
+Required item fields:
 
-- `id`
 - `source_name`
 - `remote_path`
 - `remote_url`
@@ -170,13 +210,12 @@ Unique key:
 
 - `(source_name, remote_path)`
 
-#### `modules`
+#### `modules.json`
 
 Tracks parsing results for unique downloaded file contents.
 
-Required columns:
+Required item fields:
 
-- `id`
 - `sha256`
 - `format`
 - `parse_status` (`pending`, `done`, `failed`, `skipped`)
@@ -186,42 +225,145 @@ Required columns:
 - `tracker_name`
 - `author_guess`
 - `author_source`
+- `rule_labels`
+- `llm_decision` (`run`, `skip`)
+- `llm_reason`
+- `text_fragment_count`
+- `useful_fragment_count`
 - `parsed_at`
 
 Unique key:
 
 - `sha256`
 
-#### `summaries`
+#### `summaries.json`
 
 Tracks LLM output.
 
-Required columns:
+Required item fields:
 
-- `id`
-- `module_id`
+- `sha256`
 - `model_name`
 - `prompt_version`
+- `input_text_hash`
 - `summary_status` (`pending`, `done`, `failed`, `skipped`)
 - `summary_error`
+- `summary_skip_reason`
 - `summary_path`
 - `tone`
-- `mentions_json`
+- `mentions`
 - `summarized_at`
 
-### 7.2 Resume Rules
+Unique key:
 
-The pipeline is resumable because each stage only selects records with pending or failed work.
+- `sha256`
+
+### 7.2 State Write Rules
+
+The state layer must stay simple and resilient.
+
+Rules:
+
+- state files must be valid UTF-8 JSON
+- write state to a temporary file first, then replace the previous file atomically
+- update the relevant state file after each processed item
+- creating a missing state file should initialize an empty structure
+- if a state file is unreadable JSON, the program should stop and report the file path instead of guessing
+
+Full-file rewrites are acceptable in the first version.
+
+### 7.3 Resume Rules
+
+The pipeline is resumable because each stage only selects items with pending or failed work.
 
 Rules:
 
 - discovery can be rerun at any time
-- download skips rows already marked `done` if the target file still exists
+- download skips items already marked `done` if the target file still exists
 - parse skips hashes already marked `done` if the metadata JSON still exists
-- summarization skips rows already marked `done` if the summary JSON still exists
+- summarization skips hashes already marked `done` if the summary JSON still exists
 - graph building may rebuild from scratch each time because it is derived output
 
-If a database row says `done` but the corresponding artifact file is missing, the stage must reset that row to `pending` and recreate the artifact.
+If a state item says `done` but the corresponding artifact file is missing, the stage must reset that item to `pending` and recreate the artifact.
+
+### 7.4 Example State Files
+
+Example `remote_files.json`:
+
+```json
+{
+  "version": 1,
+  "updated_at": "2026-06-23T10:00:00Z",
+  "items": [
+    {
+      "source_name": "sceneorg-artists",
+      "remote_path": "artists/traven/nytrik.mod",
+      "remote_url": "https://ftp.scene.org/pub/music/artists/traven/nytrik.mod",
+      "extension": ".mod",
+      "remote_size": 52344,
+      "remote_mtime": "1997-04-12T00:00:00Z",
+      "first_seen_at": "2026-06-23T09:52:14Z",
+      "last_seen_at": "2026-06-23T10:00:00Z",
+      "download_status": "done",
+      "download_error": null,
+      "local_path": "data/raw_modules/mod/8b4d...c1.mod",
+      "sha256": "8b4d...c1"
+    }
+  ]
+}
+```
+
+Example `modules.json`:
+
+```json
+{
+  "version": 1,
+  "updated_at": "2026-06-23T10:05:00Z",
+  "items": [
+    {
+      "sha256": "8b4d...c1",
+      "format": "mod",
+      "parse_status": "done",
+      "parse_error": null,
+      "metadata_path": "data/parsed_metadata/8b4d...c1.json",
+      "title": "Why not call?",
+      "tracker_name": "ProTracker",
+      "author_guess": "Traven",
+      "author_source": "directory_name",
+      "rule_labels": ["greeting", "signature"],
+      "llm_decision": "run",
+      "llm_reason": "contains social text beyond instrument names",
+      "text_fragment_count": 12,
+      "useful_fragment_count": 3,
+      "parsed_at": "2026-06-23T10:05:00Z"
+    }
+  ]
+}
+```
+
+Example `summaries.json`:
+
+```json
+{
+  "version": 1,
+  "updated_at": "2026-06-23T10:20:00Z",
+  "items": [
+    {
+      "sha256": "8b4d...c1",
+      "model_name": "ministral",
+      "prompt_version": "v1",
+      "input_text_hash": "31f2...9a",
+      "summary_status": "done",
+      "summary_error": null,
+      "summary_skip_reason": null,
+      "summary_path": "data/summaries/8b4d...c1.json",
+      "tone": "melancholic",
+      "mentions": ["Nytrik"],
+      "summarized_at": "2026-06-23T10:20:00Z"
+    }
+  ]
+}
+```
 
 ## 8. Artifact Naming
 
@@ -249,7 +391,7 @@ Implemented in `scripts/fetch_modules.py`.
 
 - crawl configured remote roots
 - find files matching allowed extensions
-- record or update entries in `remote_files`
+- record or update items in `remote_files.json`
 - optionally list recent discoveries
 - download files with resume support
 - compute SHA-256 during download
@@ -301,7 +443,7 @@ After download:
 - compute `sha256`
 - store the file under the canonical hash-based path
 - if another remote file already has the same hash, do not keep a second raw copy
-- still keep both `remote_files` rows so provenance is preserved
+- still keep both `remote_files.json` items so provenance is preserved
 
 ## 10. Stage 2: Parsing and Metadata Extraction
 
@@ -311,8 +453,11 @@ Implemented in `scripts/parse_modules.py`.
 
 - select unique downloaded hashes with pending parse status
 - extract textual metadata from each module
+- separate instrument-like fragments from potentially social text
+- assign first-pass rule-based labels
+- decide whether the LLM is necessary
 - save one normalized JSON file per module
-- update the `modules` table
+- update `modules.json`
 
 ### 10.2 Parsing Strategy
 
@@ -349,7 +494,18 @@ Every parsed JSON must contain these fields:
   "instrument_names": [],
   "song_message": null,
   "text_fragments": [],
+  "instrument_like_fragments": [],
+  "useful_text_fragments": [],
   "greets_rule_based": [],
+  "rule_based_classification": {
+    "labels": [],
+    "signature_fragments": [],
+    "work_offer_fragments": [],
+    "contact_fragments": [],
+    "technical_fragments": [],
+    "llm_decision": "run|skip",
+    "llm_reason": "string"
+  },
   "parsed_at": "ISO-8601 timestamp"
 }
 ```
@@ -376,7 +532,99 @@ Rules:
 - keep both raw and normalized lists simple
 - do not aggressively rewrite the text
 
-### 10.6 Greeting Extraction
+### 10.6 Instrument Name Detection
+
+The parser must detect common instrument labels before any LLM call.
+
+This should use a local dictionary from `config/instrument_terms.json`.
+
+Typical terms include:
+
+- `kick`
+- `snare`
+- `bass`
+- `piano`
+- `lead`
+- `pad`
+- `stab`
+- `hh`
+- `openhh`
+- `closedhh`
+- `vox`
+- `strings`
+- `brass`
+
+Detection rules:
+
+- compare on a lowercased and trimmed form
+- split common separators such as space, `_`, `-`, `/`, `.`
+- allow suffixes such as digits, short qualifiers, and simple FX notes
+- keep the rules conservative to avoid classifying social text as an instrument label
+
+Examples that should normally be marked as instrument-like:
+
+- `snare`
+- `bass 01`
+- `piano-rev`
+- `lead a`
+- `kickdist`
+
+Examples that should not be auto-classified as instrument-only:
+
+- `call me for music`
+- `greets to maze`
+- `bassline by traven`
+- `need swap with coders`
+
+### 10.7 First Rule-Based Classification
+
+Before any LLM call, the program must assign a first-pass classification from deterministic rules.
+
+The first version should support these labels:
+
+- `instrument_only`
+- `greeting`
+- `signature`
+- `work_offer`
+- `contact`
+- `technical_note`
+- `credits`
+- `unknown_social`
+
+Typical rule examples:
+
+- `greeting`: `greets`, `greetz`, `hello`, `hi`, `respect to`
+- `signature`: `by <handle>`, `music by`, `coded by`, `made by`
+- `work_offer`: `available for`, `looking for group`, `need musician`, `need coder`
+- `contact`: `write to`, `call me`, `contact`, `email`
+- `technical_note`: `play loud`, `use headphones`, `4 channel`, `stereo`
+- `credits`: `samples by`, `inspired by`, `ripped from`
+
+The rule-based layer should be enough to classify many modules without any LLM call.
+
+### 10.8 LLM Eligibility Decision
+
+At the end of parsing, each module must receive `llm_decision = run` or `skip`.
+
+The default must be to skip unless there is a good reason to call the model.
+
+The LLM should be skipped when:
+
+- all extracted text is instrument-like
+- there are no `useful_text_fragments`
+- the only detected labels are routine labels such as `instrument_only`, `greeting`, `signature`, `work_offer`, `contact`, or `technical_note`
+- the useful text is too short to justify inference
+
+The LLM should run when:
+
+- the useful text contains sentence-like social content
+- the text is ambiguous after the rule-based pass
+- emotional or interpersonal content seems present
+- the module contains non-trivial free text that may reveal context, tone, or relations
+
+The parser should store a human-readable `llm_reason` so the decision is easy to audit.
+
+### 10.9 Greeting Extraction
 
 Greeting extraction should start with deterministic rules, not with the LLM alone.
 
@@ -397,8 +645,9 @@ Implemented in `scripts/run_ollama.py`.
 
 ### 11.1 Responsibilities
 
-- select parsed modules with pending summary status
-- build a prompt from extracted text
+- select parsed modules marked `llm_decision = run`
+- reuse an existing summary when the filtered input text is identical
+- build a prompt from useful extracted text only
 - call Ollama over HTTP
 - write normalized summary JSON
 - store summary status and extracted mentions
@@ -418,7 +667,25 @@ If a module has no meaningful text:
 - create a summary JSON with `summary_status = skipped`
 - record the reason
 
-### 11.4 Prompt Contract
+If `llm_decision = skip` in `modules.json`:
+
+- do not call Ollama
+- create or update the summary state with `summary_status = skipped`
+- set `summary_skip_reason` from the parser decision
+
+### 11.4 LLM Cost Control
+
+The LLM is expected to be slow and should be treated as a selective enrichment step, not as the default parser.
+
+Required controls:
+
+- never send instrument-only fragments
+- never send obvious rule-based cases unless explicitly forced
+- send only `useful_text_fragments`, not the full raw extracted text
+- compute `input_text_hash` on the filtered text and reuse an existing result when the same text was already summarized
+- support a CLI flag to force re-run for selected hashes only
+
+### 11.5 Prompt Contract
 
 The prompt must ask for a strict JSON response.
 
@@ -435,8 +702,9 @@ Required response fields:
 ```
 
 The prompt version must be stored so summaries can be regenerated later if the prompt changes.
+If the configured model or prompt version changes, the existing summary item for that hash should be set back to `pending`.
 
-### 11.5 Summary Output Format
+### 11.6 Summary Output Format
 
 Each summary JSON should contain:
 
@@ -444,8 +712,10 @@ Each summary JSON should contain:
 {
   "sha256": "string",
   "summary_status": "done|skipped|failed",
+  "summary_skip_reason": "string or null",
   "model_name": "ministral",
   "prompt_version": "v1",
+  "input_text_hash": "string",
   "input_text_fragments": [],
   "summary": "string",
   "tone": "string or null",
@@ -455,6 +725,37 @@ Each summary JSON should contain:
   "summarized_at": "ISO-8601 timestamp"
 }
 ```
+
+### 11.7 Optional Embeddings-Assisted Classification
+
+Embeddings may help later, but they should not be in the critical path of the first implementation.
+
+Recommended position:
+
+- rule-based filtering first
+- optional embeddings second, only for unresolved non-instrument text
+- LLM summarization last, only for modules that still justify it
+
+Embeddings are useful for:
+
+- clustering similar social fragments
+- suggesting labels for `unknown_social` fragments from already labeled examples
+- finding repeated message templates across many modules
+- improving search and exploration in the final corpus
+
+Embeddings are not the right first tool for:
+
+- instrument name detection
+- simple greeting detection
+- obvious signatures
+- basic work-offer or contact patterns
+
+If embeddings are added later:
+
+- keep them optional behind `embeddings.enabled`
+- do not block the main pipeline when embeddings are disabled
+- do not store raw embedding vectors in the main state files
+- store only embedding metadata in JSON state, and keep any vector artifacts separate under `data/embeddings/`
 
 ## 12. Stage 4: Graph Building
 
@@ -534,7 +835,7 @@ The code should handle only the common operational failures:
 Handling rules:
 
 - mark the current item as failed
-- save the error message in the database
+- save the error message in the relevant state file
 - continue with the next item
 
 Do not add elaborate retry frameworks.
@@ -550,7 +851,7 @@ The implementation should follow these rules:
 
 - use `argparse` for CLI parsing
 - use `pathlib.Path`
-- use `sqlite3`
+- use `json`
 - keep functions short
 - avoid nested abstractions
 - avoid decorators
@@ -562,7 +863,7 @@ Preferred style:
 
 - one file per stage
 - one helper module per concern
-- explicit SQL statements
+- explicit JSON load and save functions
 - explicit loops
 - explicit intermediate variables
 
@@ -573,11 +874,13 @@ The first usable version is complete when it can:
 1. crawl at least one configured remote source and record discovered module files
 2. download a batch of module files and resume after interruption
 3. deduplicate identical files by content hash
-4. parse at least title plus embedded textual sample or instrument names where available
-5. write one metadata JSON per parsed file
-6. summarize files with meaningful text through local Ollama
-7. build one directed graph export from the available results
-8. rerun safely without redoing already completed work
+4. detect instrument-like text locally and avoid sending it to the LLM
+5. classify obvious cases locally such as greetings, signatures, contact, and work offers
+6. parse at least title plus embedded textual sample or instrument names where available
+7. write one metadata JSON per parsed file
+8. summarize only modules with meaningful unresolved text through local Ollama
+9. build one directed graph export from the available results
+10. rerun safely without redoing already completed work
 
 ## 18. Verification Scenarios
 
@@ -601,7 +904,7 @@ The implementation should be checked against these scenarios:
 
 - delete one metadata or summary JSON manually
 - rerun the relevant stage
-- confirm the database entry is reset to `pending` and the file is recreated
+- confirm the state item is reset to `pending` and the file is recreated
 
 ### Scenario D: New Remote Content
 
@@ -609,16 +912,34 @@ The implementation should be checked against these scenarios:
 - run discovery again after new source content appears
 - confirm only new or updated files enter the pending download set
 
+### Scenario E: Instrument-Only Module
+
+- parse a module whose extracted text is only instrument labels
+- confirm it receives `llm_decision = skip`
+- confirm `summaries.json` records `summary_status = skipped`
+
+### Scenario F: Obvious Greeting Without LLM
+
+- parse a module containing `greets to xxx, yyy`
+- confirm the greeting targets are extracted by rules
+- confirm the module may skip the LLM if there is no richer text
+
+### Scenario G: Duplicate Useful Text
+
+- process two modules with the same filtered useful text
+- confirm the second module reuses the first summary instead of calling Ollama again
+
 ## 19. Implementation Priority
 
 Recommended order:
 
-1. database and config helpers
+1. state and config helpers
 2. discovery and download
 3. parser for MOD
-4. parser support for XM, S3M, IT
-5. Ollama integration
-6. graph export
-7. thin orchestrator
+4. local instrument detection and rule-based classification
+5. parser support for XM, S3M, IT
+6. Ollama integration with summary reuse
+7. graph export
+8. thin orchestrator
 
 This order gives a working pipeline early and keeps the first milestone small.
