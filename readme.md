@@ -8,6 +8,7 @@
 
 - Mirror/download a large dataset of ProTracker (MOD), FastTracker (XM), ScreamTracker (S3M), and Impulse Tracker (IT) music modules.
   - primary source : https://ftp.scene.org/pub/music/artists/
+  - secondary source : https://modland.com/pub/modules/Protracker/
 - Extract embedded text content (instrument/sample names, song messages).
 - Classify and group modules by artist/handle.
 - Use local LLM (via [Ollama](https://ollama.ai/)) to:
@@ -50,10 +51,10 @@ MODialogues/
 
 - [ ] Write `fetch_modules.py`
   - Mirror selected directories from:
-    - `ftp.scene.org/pub/mod/`
-    - Optional: `modarchive.org` (respecting API limits)
+    - `https://ftp.scene.org/pub/music/artists/`
+    - `https://modland.com/pub/modules/Protracker/`
   - Organize downloads by filetype (`.mod`, `.xm`, etc.)
-  - Avoid duplicates (e.g., MD5 hashes)
+  - Compare duplicate candidates by checksum and keep source provenance per mirrored path
 
 ---
 
@@ -91,15 +92,21 @@ MODialogues/
 
 - [ ] Write `run_ollama.py`:
   - Use local Ollama (with `mistral`, `llama3`, or similar lightweight model)
-  - Feed sample names and messages with a prompt like:
-    > "This is a text extracted from a 1990s MOD tracker music file. Please summarize the emotional tone, intention, and probable context of these messages."
+  - Feed ordered sample names and messages with a structured extraction prompt
+  - Ask the model to reconstruct split phrases, extract entities and relations, and separate factual clues from poetic or ambiguous text
 
   - Output example:
     ```json
     {
-      "summary": "The author expresses a sense of disappointment and longing toward a fellow musician named Nytrik.",
-      "tone": "melancholic",
-      "mentions": ["Nytrik"]
+      "summary": "Module text references the handle Puh, the group Dreamdealers, and a likely former alias Shout.",
+      "language": "fr",
+      "entities": [
+        {"id": "e1", "type": "handle", "value": "Puh"},
+        {"id": "e2", "type": "group", "value": "Dreamdealers"}
+      ],
+      "relations": [
+        {"subject_id": "e1", "predicate": "member_of", "object_id": "e2"}
+      ]
     }
     ```
 

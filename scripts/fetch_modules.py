@@ -3,7 +3,7 @@ import shutil
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 from urllib.request import Request, url2pathname, urlopen
 
 from common_config import (
@@ -54,17 +54,60 @@ def get_enabled_sources(config, selected_names):
     return sources
 
 
-def discover_http_index(source, allowed_extensions, user_agent, timeout_seconds, logger):
+def build_http_roots(source):
+    base_url = source["base_url"]
+    include_prefixes = source.get("include_prefixes") or []
+    if not include_prefixes:
+        return [base_url]
+
+    roots = []
+    for prefix in include_prefixes:
+        parts = []
+        for raw_part in str(prefix).replace("\\", "/").split("/"):
+            part = raw_part.strip()
+            if not part or part in [".", ".."]:
+                continue
+            parts.append(quote(part))
+
+        if not parts:
+            continue
+
+        roots.append(urljoin(base_url, "/".join(parts) + "/"))
+
+    return roots or [base_url]
+
+
+def flush_discovered_batch(discovered_items, checkpoint_callback):
+    if checkpoint_callback is None or not discovered_items:
+        return 0, 0
+
+    created_count, updated_count = checkpoint_callback(discovered_items)
+    discovered_items.clear()
+    return created_count, updated_count
+
+
+def discover_http_index(source, allowed_extensions, user_agent, timeout_seconds, logger, checkpoint_callback=None, batch_size=1000):
     base_url = source["base_url"]
     visited = set()
-    pending = [base_url]
+    pending = list(reversed(build_http_roots(source)))
     discovered = []
+    created_total = 0
+    updated_total = 0
+    discovered_total = 0
 
     while pending:
         current_url = pending.pop()
         if current_url in visited:
             continue
         visited.add(current_url)
+
+        if len(visited) % 250 == 0:
+            logger.info(
+                "Discovery progress for %s: %s directories visited, %s files seen",
+                source["name"],
+                len(visited),
+                discovered_total
+            )
 
         logger.info("Discovering %s", current_url)
         request = Request(current_url, headers={"User-Agent": user_agent})
@@ -104,6 +147,30 @@ def discover_http_index(source, allowed_extensions, user_agent, timeout_seconds,
                 "remote_size": None,
                 "remote_mtime": None
             })
+            discovered_total += 1
+
+            if checkpoint_callback is not None and len(discovered) >= batch_size:
+                created_count, updated_count = flush_discovered_batch(discovered, checkpoint_callback)
+                created_total += created_count
+                updated_total += updated_count
+                logger.info(
+                    "Discovery checkpoint for %s: %s files seen, %s new, %s updated",
+                    source["name"],
+                    discovered_total,
+                    created_total,
+                    updated_total
+                )
+
+    if checkpoint_callback is not None:
+        created_count, updated_count = flush_discovered_batch(discovered, checkpoint_callback)
+        created_total += created_count
+        updated_total += updated_count
+        return {
+            "created": created_total,
+            "updated": updated_total,
+            "discovered": discovered_total,
+            "visited": len(visited)
+        }
 
     return discovered
 
@@ -132,10 +199,45 @@ def discover_local_dir(source, allowed_extensions):
     return discovered
 
 
-def discover_sources(config, sources, logger):
+def discover_sources(config, sources, logger, checkpoint_callback=None):
     allowed_extensions = set(value.lower() for value in config["allowed_extensions"])
     user_agent = config.get("user_agent", "MODialogues/0.1")
     timeout_seconds = config.get("download_timeout_seconds", 60)
+    batch_size = config.get("discovery_batch_size", 1000)
+
+    if checkpoint_callback is not None:
+        created_total = 0
+        updated_total = 0
+        for source in sources:
+            source_type = source["type"]
+            if source_type == "http_index":
+                result = discover_http_index(
+                    source,
+                    allowed_extensions,
+                    user_agent,
+                    timeout_seconds,
+                    logger,
+                    checkpoint_callback=checkpoint_callback,
+                    batch_size=batch_size
+                )
+                created_total += result["created"]
+                updated_total += result["updated"]
+                logger.info(
+                    "Source discovery complete for %s: %s directories visited, %s files seen",
+                    source["name"],
+                    result["visited"],
+                    result["discovered"]
+                )
+            elif source_type == "local_dir":
+                discovered_items = discover_local_dir(source, allowed_extensions)
+                created_count, updated_count = checkpoint_callback(discovered_items)
+                created_total += created_count
+                updated_total += updated_count
+                logger.info("Source discovery complete for %s: %s files seen", source["name"], len(discovered_items))
+            else:
+                logger.warning("Unsupported source type: %s", source_type)
+
+        return created_total, updated_total
 
     discovered = []
     for source in sources:
@@ -361,9 +463,12 @@ def main():
     download_selected = args.download or (not args.discover and not args.download and args.recent_days is None)
 
     if discover_selected:
-        discovered_items = discover_sources(config, sources, logger)
-        created_count, updated_count = update_remote_state(remote_state, discovered_items)
-        save_state(remote_state_path, remote_state)
+        def checkpoint_callback(discovered_items):
+            created_count, updated_count = update_remote_state(remote_state, discovered_items)
+            save_state(remote_state_path, remote_state)
+            return created_count, updated_count
+
+        created_count, updated_count = discover_sources(config, sources, logger, checkpoint_callback=checkpoint_callback)
         logger.info("Discovery complete: %s new, %s updated", created_count, updated_count)
 
     if download_selected:

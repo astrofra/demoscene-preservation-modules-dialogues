@@ -11,6 +11,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run the MODialogues prototype pipeline.")
     parser.add_argument("--config", default=None, help="Path to a config JSON file.")
     parser.add_argument("--limit", type=int, default=None, help="Limit items for each applicable stage.")
+    parser.add_argument("--source", action="append", default=None, help="Restrict to one or more source names.")
     parser.add_argument("--skip-discover", action="store_true", help="Skip discovery.")
     parser.add_argument("--skip-download", action="store_true", help="Skip download.")
     parser.add_argument("--skip-parse", action="store_true", help="Skip parsing.")
@@ -33,6 +34,9 @@ def main():
 
     if not args.skip_discover or not args.skip_download:
         fetch_args = list(shared_args)
+        if args.source:
+            for source_name in args.source:
+                fetch_args.extend(["--source", source_name])
         if args.limit is not None:
             fetch_args.extend(["--limit", str(args.limit)])
         if not args.skip_discover:
@@ -43,12 +47,18 @@ def main():
 
     if not args.skip_parse:
         parse_stage_args = list(shared_args)
+        if args.source:
+            for source_name in args.source:
+                parse_stage_args.extend(["--source", source_name])
         if args.limit is not None:
             parse_stage_args.extend(["--limit", str(args.limit)])
         run_script("parse_modules.py", parse_stage_args)
 
     if not args.skip_summarize:
         summarize_args = list(shared_args)
+        if args.source:
+            for source_name in args.source:
+                summarize_args.extend(["--source", source_name])
         if args.limit is not None:
             summarize_args.extend(["--limit", str(args.limit)])
         run_script("run_ollama.py", summarize_args)

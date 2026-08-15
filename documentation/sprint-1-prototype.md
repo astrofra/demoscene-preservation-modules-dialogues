@@ -50,6 +50,7 @@ The main goal is to validate the workflow shape:
 
 - complete XM/S3M/IT structural parsing
 - embeddings in the critical path
+- librosa-based sample audio semantics in the critical path
 - web UI
 - concurrency
 - remote timestamp parsing from arbitrary HTML listings
@@ -124,6 +125,9 @@ Recommended order:
 - extend real parsing for XM, S3M, and IT
 - improve author guessing
 - add better greeting target extraction
+- prototype sample extraction and offline `librosa` descriptors
+- distinguish raw sample pitch from playback-aware tessitura
+- test whether coarse labels such as `percussive`, `voice_like`, or `bass_like` are stable enough to reuse in graph exploration
 - add fixture-based automated tests
 - add optional embeddings for unresolved text clustering
 - add corpus-level reports and statistics

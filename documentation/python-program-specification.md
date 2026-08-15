@@ -9,6 +9,7 @@ The program must:
 - discover tracker module files from one or more remote sources
 - download new files and resume interrupted downloads
 - parse embedded textual metadata from module files
+- leave a documented extension path for future sample-level audio analysis with `librosa`
 - run a local Ollama model on extracted text
 - detect greetings and mentions between scene members
 - build exportable relationship graphs
@@ -39,11 +40,13 @@ The implementation must favor simple, readable Python over abstraction-heavy des
 - greeting / mention extraction
 - graph export
 - CLI scripts for running one stage or the whole pipeline
+- documentation-ready extension points for future audio-semantic enrichment
 
 ### Out of Scope for the First Implementation
 
 - web UI
 - audio playback
+- librosa-based audio semantics in the critical path
 - distributed processing
 - parallel workers
 - automatic cloud deployment
@@ -89,12 +92,15 @@ MODialogues/
 |   +-- parsed_metadata/
 |   +-- summaries/
 |   +-- graphs/
+|   +-- extracted_samples/    # Optional future stage for raw sample waveforms
+|   +-- audio_features/       # Optional future stage for librosa descriptors
 |   +-- embeddings/          # Optional, not required for the first version
 |   +-- logs/
 |   +-- state/
 |       +-- remote_files.json
 |       +-- modules.json
 |       +-- summaries.json
+|       +-- audio_features.json   # Optional future stage
 |
 +-- scripts/
 |   +-- fetch_modules.py
@@ -128,6 +134,12 @@ Example structure:
       "name": "sceneorg-artists",
       "type": "http_index",
       "base_url": "https://ftp.scene.org/pub/music/artists/"
+    },
+    {
+      "name": "modland-protracker",
+      "type": "http_index",
+      "base_url": "https://modland.com/pub/modules/Protracker/",
+      "include_prefixes": ["Beek", "Carlos", "DJ Zip", "FBY", "Maf", "Mellow-D", "Necros", "Radix", "Stinger", "Zipp"]
     }
   ],
   "allowed_extensions": [".mod", ".xm", ".s3m", ".it"],
@@ -157,12 +169,23 @@ Example structure:
     "base_url": "http://127.0.0.1:11434",
     "model": "qwen3-embedding"
   },
+  "audio_semantics": {
+    "enabled": false,
+    "extract_samples": false,
+    "librosa_sample_rate": 22050,
+    "min_sample_duration_ms": 80,
+    "pitch_estimator": "pyin",
+    "write_extracted_samples": true
+  },
   "paths": {
     "state_dir": "data/state",
     "remote_files_state": "data/state/remote_files.json",
     "modules_state": "data/state/modules.json",
     "summaries_state": "data/state/summaries.json",
-    "embeddings_dir": "data/embeddings"
+    "embeddings_dir": "data/embeddings",
+    "extracted_samples_dir": "data/extracted_samples",
+    "audio_features_dir": "data/audio_features",
+    "audio_features_state": "data/state/audio_features.json"
   }
 }
 ```
@@ -432,6 +455,7 @@ The crawler only needs to support:
 - HTML directory listings with links
 - recursive traversal
 - filtering by extension
+- optional source-scoped start prefixes such as selected artist directories under a larger index root
 
 If a source exposes timestamps, they should be stored in `remote_mtime`.
 If not, `first_seen_at` becomes the fallback definition of "recent".
@@ -470,6 +494,7 @@ After download:
 - store the file under its readable mirrored path
 - keep the hash in state for integrity checks
 - detect identical content through `sha256`
+- use the hash to compare overlap across mirrors such as `sceneorg-artists` and `modland-protracker`
 - do not use the hash as the primary visible filename
 
 ## 10. Stage 2: Parsing and Metadata Extraction
@@ -668,6 +693,116 @@ Examples of patterns to detect:
 The output should be conservative.
 If a name is uncertain, it should be omitted rather than guessed.
 
+### 10.10 Future Audio-Semantic Enrichment with `librosa`
+
+This is a roadmap item, not a requirement for the first implementation.
+
+The main idea is to analyze extracted sample or instrument waveforms as a second semantic layer beside text.
+
+Important methodological rule:
+
+- sample-waveform analysis is not the same as playback-aware tessitura analysis
+
+The first future stage should describe the sound material itself.
+Only a later stage should attempt to reconstruct how that material is actually used in patterns.
+
+#### Why This Is Useful
+
+It can add semantic signals for modules that have little textual content, and it can reveal sonic neighborhoods such as:
+
+- strongly percussive modules
+- voice-like or choir-like material
+- low-register or bass-heavy palettes
+- bright metallic palettes
+- sustained harmonic textures
+
+#### What `librosa` Can Contribute
+
+Based on the official `librosa` documentation, the project can use:
+
+- spectral descriptors such as centroid, bandwidth, contrast, flatness, rolloff, RMS, and zero-crossing rate
+- timbral summaries such as MFCCs and mel-spectrogram statistics
+- tonal descriptors such as chroma and tonnetz for pitched material
+- pitch estimators such as `yin` and `pyin`
+- onset and beat descriptors such as `onset_strength` and `beat_track`
+- harmonic/percussive decomposition through HPSS
+
+Useful official references:
+
+- `https://librosa.org/doc/0.11.0/feature.html`
+- `https://librosa.org/doc/latest/generated/librosa.pyin.html`
+- `https://librosa.org/doc/latest/generated/librosa.onset.onset_strength.html`
+- `https://librosa.org/doc/latest/generated/librosa.beat.beat_track.html`
+- `https://librosa.org/doc/0.11.0/generated/librosa.effects.hpss.html`
+
+#### Limits
+
+The program should not pretend that `librosa` directly knows categories such as:
+
+- `strings`
+- `winds`
+- `percussion`
+- `voice`
+
+Those must be treated as inferred family guesses with confidence values.
+
+The program should also distinguish:
+
+- intrinsic sample pitch or pitch center
+- actual played register inside a module
+
+The second point requires note-event parsing and therefore belongs to a later stage.
+
+#### Recommended Future Responsibilities
+
+- extract raw sample waveforms from supported formats when possible
+- compute per-sample audio descriptors offline
+- aggregate descriptors into module-level audio profiles
+- derive coarse labels such as `percussive`, `voice_like`, `pitched_sustained`, `noise_like`, `bass_like`, or `lead_like`
+- optionally derive weaker family guesses such as `strings_like`, `winds_like`, or `choir_or_voice_like`
+- export evidence and confidence values instead of hard labels only
+
+#### Recommended Future Output Fields
+
+Per-sample artifacts may include:
+
+- `sample_id`
+- `module_id`
+- `sample_index`
+- `sample_name`
+- `duration_seconds`
+- `voiced_ratio`
+- `f0_median_hz`
+- `spectral_centroid_mean`
+- `spectral_bandwidth_mean`
+- `spectral_flatness_mean`
+- `spectral_contrast_mean`
+- `harmonic_ratio`
+- `percussive_ratio`
+- `role_labels`
+- `family_labels`
+- `confidence`
+
+Module-level aggregation may include:
+
+- `dominant_audio_roles`
+- `dominant_family_guesses`
+- `register_profile`
+- `brightness_profile`
+- `harmonic_percussive_profile`
+- `voice_like_presence`
+- `audio_similarity_neighbors`
+
+#### Future State Rules
+
+If this stage is implemented later, it should follow the same resilience rules as the rest of the pipeline:
+
+- one JSON state file for progress
+- one artifact file per processed unit
+- clear `pending`, `done`, `failed`, and `skipped` statuses
+- resumable processing
+- no expensive recomputation in downstream stages when nothing changed
+
 ## 11. Stage 3: LLM Summarization
 
 Implemented in `scripts/run_ollama.py`.
@@ -709,10 +844,19 @@ The LLM is expected to be slow and should be treated as a selective enrichment s
 Required controls:
 
 - never send instrument-only fragments
-- never send obvious rule-based cases unless explicitly forced
+- never send obvious low-value rule-based cases unless explicitly forced
 - send only `useful_text_fragments`, not the full raw extracted text
 - compute `input_text_hash` on the filtered text and reuse an existing result when the same text was already summarized
 - support a CLI flag to force re-run for selected hashes only
+
+The parser should still force the LLM when rule-based text contains high-value archival signals such as:
+
+- alias changes
+- real names
+- postal addresses
+- dated signatures
+- compact handle/group signatures
+- contact details
 
 ### 11.5 Prompt Contract
 
@@ -722,10 +866,46 @@ Required response fields:
 
 ```json
 {
-  "summary": "short summary",
-  "tone": "one short label",
-  "mentions": ["handle1", "handle2"],
-  "relationship_notes": ["optional short notes"],
+  "summary": "short factual summary",
+  "tone": "one short label or null",
+  "language": "fr|en|mixed|unknown",
+  "reconstructed_segments": [
+    {
+      "fragment_indexes": [1, 2],
+      "text": "reconstructed text",
+      "kind": "factual|signature|contact|poetic|unclear",
+      "confidence": "low|medium|high"
+    }
+  ],
+  "entities": [
+    {
+      "id": "e1",
+      "type": "handle|group|person_name|address|place|date|time|title|abbreviation|unclear_reference",
+      "value": "raw entity text",
+      "normalized": "normalized entity text",
+      "confidence": "low|medium|high",
+      "evidence_fragment_indexes": [1, 3]
+    }
+  ],
+  "relations": [
+    {
+      "subject_id": "e1",
+      "predicate": "current_handle|former_handle|alias_change|member_of|real_name_of|contact_address_of|signed_on|signed_at|related_to_group|possible_slogan_or_poetic_text|unclear_reference",
+      "object_id": "e2",
+      "object_value": null,
+      "confidence": "low|medium|high",
+      "evidence_fragment_indexes": [1, 4],
+      "note": "short factual note"
+    }
+  ],
+  "interpretation": "short interpretation that distinguishes facts from stylistic text",
+  "ambiguities": [
+    {
+      "text": "23.0",
+      "possible_meanings": ["time", "version number"],
+      "confidence": "low|medium|high"
+    }
+  ],
   "confidence": "low|medium|high"
 }
 ```
@@ -749,8 +929,14 @@ Each summary JSON should contain:
   "input_text_fragments": [],
   "summary": "string",
   "tone": "string or null",
+  "language": "string",
+  "reconstructed_segments": [],
+  "entities": [],
+  "relations": [],
+  "interpretation": "string or null",
+  "ambiguities": [],
   "mentions": [],
-  "relationship_notes": [],
+  "relationship_notes": {},
   "confidence": "string or null",
   "summarized_at": "ISO-8601 timestamp"
 }
@@ -806,6 +992,11 @@ Implemented in `scripts/build_graph.py`.
 - edge weight = count of repeated occurrences
 
 Rule-based greetings and LLM mentions should stay distinguishable in the exported data.
+
+Future extension:
+
+- add module-to-module audio affinity exports separately from handle graphs
+- do not mix weak audio guesses into the main handle graph without explicit edge typing
 
 ### 12.3 Exports
 
@@ -959,6 +1150,17 @@ The implementation should be checked against these scenarios:
 - process two modules with the same filtered useful text
 - confirm the second module reuses the first summary instead of calling Ollama again
 
+### Scenario H: Short or Noisy Sample in Audio-Semantic Stage
+
+- run the future audio-semantic stage on a very short or noisy sample
+- confirm pitch estimation may be skipped
+- confirm the item still receives partial spectral descriptors without crashing the batch
+
+### Scenario I: Raw Sample Pitch Versus Played Register
+
+- run the future audio-semantic stage on a sample that is later reused at several note values
+- confirm the raw sample pitch is stored separately from any later playback-aware tessitura estimate
+
 ## 19. Implementation Priority
 
 Recommended order:
@@ -973,3 +1175,14 @@ Recommended order:
 8. thin orchestrator
 
 This order gives a working pipeline early and keeps the first milestone small.
+
+### After the First Working Milestone
+
+Recommended expansion order:
+
+1. sample extraction for formats with accessible PCM data
+2. `librosa`-based descriptor extraction
+3. conservative role labels such as `percussive` or `voice_like`
+4. clustering of unresolved material
+5. playback-aware tessitura from note-event analysis
+6. separate audio-affinity graph exports

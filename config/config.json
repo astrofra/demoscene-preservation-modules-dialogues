@@ -5,6 +5,12 @@
       "type": "http_index",
       "enabled": true,
       "base_url": "https://ftp.scene.org/pub/music/artists/"
+    },
+    {
+      "name": "modland-protracker",
+      "type": "http_index",
+      "enabled": true,
+      "base_url": "https://modland.com/pub/modules/Protracker/"
     }
   ],
   "allowed_extensions": [
@@ -20,19 +26,32 @@
     "rule_patterns_path": "config/rule_patterns.json",
     "llm_min_useful_chars": 24,
     "llm_min_social_fragments": 1,
+    "llm_force_if_labels": [
+      "signature",
+      "contact",
+      "credits",
+      "work_offer",
+      "unknown_social"
+    ],
+    "llm_force_if_signal_flags": [
+      "alias_change",
+      "address_like",
+      "person_name_like",
+      "dated_signature",
+      "email_like",
+      "phone_like",
+      "group_signature"
+    ],
     "llm_skip_if_only_labels": [
       "instrument_only",
       "greeting",
-      "signature",
-      "work_offer",
-      "contact",
       "technical_note"
     ]
   },
   "ollama": {
     "base_url": "http://127.0.0.1:11434",
-    "model": "ministral",
-    "timeout_seconds": 120
+    "model": "ministral-3:14b",
+    "timeout_seconds": 300
   },
   "embeddings": {
     "enabled": false,

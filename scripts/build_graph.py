@@ -17,6 +17,51 @@ def node_key(handle):
     return handle.lower()
 
 
+GENERIC_MENTION_TERMS = {
+    "address",
+    "addresses",
+    "aliases",
+    "artists",
+    "contact",
+    "contact info",
+    "contacts",
+    "context",
+    "date",
+    "dates",
+    "entities",
+    "group",
+    "groups",
+    "handle",
+    "handles",
+    "individual",
+    "individuals",
+    "location",
+    "locations",
+    "mention",
+    "mentions",
+    "musician",
+    "musicians",
+    "nickname",
+    "nicknames",
+    "people",
+    "person",
+    "place",
+    "places",
+    "real name",
+    "real names",
+    "reference",
+    "references",
+    "scene members",
+    "theme",
+    "themes"
+}
+GRAPH_ENTITY_TYPES = {
+    "handle",
+    "group",
+    "person_name"
+}
+
+
 def register_node(nodes, handle):
     normalized = normalize_handle(handle)
     if not normalized:
@@ -44,6 +89,108 @@ def add_edge(edges, source_id, target_id, kind):
             "weight": 0
         }
     edges[edge_key]["weight"] += 1
+
+
+def is_generic_mention(value):
+    if not isinstance(value, str):
+        return False
+
+    cleaned = value.strip().lower().strip(".:,;!?()[]{}")
+    return cleaned in GENERIC_MENTION_TERMS
+
+
+def normalize_summary_mention(value):
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned and not is_generic_mention(cleaned):
+            return cleaned
+        return None
+    if not isinstance(value, dict):
+        return None
+
+    for key in ["entity", "name", "value", "phone", "address", "note", "context"]:
+        candidate = value.get(key)
+        if isinstance(candidate, str):
+            cleaned = candidate.strip()
+            if cleaned and not is_generic_mention(cleaned):
+                return cleaned
+
+    return None
+
+
+def normalize_entity_type(value):
+    if not isinstance(value, str):
+        return None
+
+    cleaned = value.strip().lower()
+    aliases = {
+        "alias": "handle",
+        "artist_handle": "handle",
+        "nickname": "handle",
+        "crew": "group",
+        "person": "person_name",
+        "real_name": "person_name",
+        "name": "person_name"
+    }
+    return aliases.get(cleaned, cleaned)
+
+
+def iter_structured_entity_mentions(summary_payload):
+    seen = set()
+    for raw_entity in summary_payload.get("entities", []):
+        if not isinstance(raw_entity, dict):
+            continue
+        entity_type = normalize_entity_type(raw_entity.get("type"))
+        if entity_type not in GRAPH_ENTITY_TYPES:
+            continue
+        mention = normalize_summary_mention(raw_entity.get("normalized") or raw_entity.get("value") or raw_entity.get("name"))
+        if mention and mention not in seen:
+            seen.add(mention)
+            yield mention
+
+
+def iter_summary_mentions(summary_payload):
+    structured_mentions = list(iter_structured_entity_mentions(summary_payload))
+    if structured_mentions:
+        for mention in structured_mentions:
+            yield mention
+        return
+
+    seen = set()
+
+    for raw_mention in summary_payload.get("mentions", []):
+        mention = normalize_summary_mention(raw_mention)
+        if mention and mention not in seen:
+            seen.add(mention)
+            yield mention
+
+    relationship_notes = summary_payload.get("relationship_notes")
+    if isinstance(relationship_notes, dict):
+        for key, nested in relationship_notes.items():
+            key_mention = normalize_summary_mention(key)
+            if key_mention and key_mention not in seen:
+                seen.add(key_mention)
+                yield key_mention
+
+            if isinstance(nested, dict):
+                nested_mention = normalize_summary_mention(nested)
+                if nested_mention and nested_mention not in seen:
+                    seen.add(nested_mention)
+                    yield nested_mention
+            elif isinstance(nested, list):
+                for item in nested:
+                    nested_mention = normalize_summary_mention(item)
+                    if nested_mention and nested_mention not in seen:
+                        seen.add(nested_mention)
+                        yield nested_mention
+    elif isinstance(relationship_notes, list):
+        for nested in relationship_notes:
+            if not isinstance(nested, dict):
+                continue
+            mention = normalize_summary_mention(nested)
+            if mention and mention not in seen:
+                seen.add(mention)
+                yield mention
 
 
 def write_dot(path, nodes, edges):
@@ -148,7 +295,7 @@ def main():
             continue
 
         summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
-        for mention in summary_payload.get("mentions", []):
+        for mention in iter_summary_mentions(summary_payload):
             target_id = register_node(nodes, mention)
             add_edge(edges, source_id, target_id, "mention")
 
